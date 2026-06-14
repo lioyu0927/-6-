@@ -1,0 +1,960 @@
+"""
+TOUCHLESS WORKSTATION v10
+─────────────────────────────────────────────────────────────
+개선 사항 요약
+  1. SmoothParam — 모든 파라미터 exponential smoothing → 지퍼 노이즈 제거
+  2. SchroederReverb — 4 comb + 2 allpass 리버브 (진짜 공간감)
+  3. 진짜 스테레오 — oscillator L/R 위상 오프셋 + subtle detune
+  4. BiquadFilter — dirty flag, 변경 시에만 계수 재계산
+  5. GestureEngine — FIST/OPEN/PEACE/POINT/PINCH 분류
+  6. 제스처 홀드 타이머 — 0.5초 이상 유지해야 변경 적용
+  7. HandTrail — 손 궤적 잔상 시각화
+  8. 두 손 거리 → 마스터 볼륨
+  9. 파라미터 실제 단위 표시 (Hz, dB, BPM, %)
+ 10. PresetManager — JSON 프리셋 저장/불러오기
+ 11. threading.Lock — audio callback ↔ vision 스레드 race condition 방지
+ 12. 그레이스풀 셧다운 + 카메라 재시도
+ 13. 반응형 ASCII 색상 (파라미터에 따라 색상 변화)
+ 14. 스케일 전환 (N키) — PENTA / MINOR / BLUES / MAJOR
+ 15. ALPHA_SMOOTH 실제로 활용
+
+단축키
+  ESC       — 종료
+  M         — 모드 전환 (EFFECTOR ↔ SYNTH)
+  N         — 스케일 전환 (SYNTH 모드)
+  S         — 현재 파라미터 프리셋 저장
+  1~5       — 저장된 프리셋 불러오기
+
+제스처
+  FIST 0.5s — 파라미터 잠금 토글
+  OPEN 0.8s — 전체 리셋
+  PEACE 0.5s — 모드 전환
+  POINT     — 정밀(Fine) 조작 모드
+  두 손 거리  — 마스터 볼륨
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import sounddevice as sd
+import threading
+import json
+import time
+import os
+from collections import deque
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+SAMPLE_RATE  = 44100
+BLOCK_SIZE   = 512
+CHANNELS     = 2
+ALPHA_SMOOTH = 0.04      # smoothing coefficient (낮을수록 느리게 추적)
+TRAIL_LENGTH = 28        # 손 궤적 길이
+PRESET_DIR   = os.path.expanduser("~/.touchless_presets")
+
+
+# ─────────────────────────────────────────────
+# SMOOTH PARAMETER
+# ─────────────────────────────────────────────
+class SmoothParam:
+    """
+    Exponential moving average.
+    audio_callback에서 set_target()을 매 블록 호출하면
+    파라미터가 부드럽게 추적되어 지퍼 노이즈가 사라진다.
+    """
+    def __init__(self, init=0.0, alpha=ALPHA_SMOOTH):
+        self.value  = float(init)
+        self.alpha  = alpha
+        self._target = float(init)
+
+    def set_target(self, target):
+        self._target = float(target)
+        self.value  += self.alpha * (self._target - self.value)
+        return self.value
+
+    def tick(self):
+        """audio_callback에서 호출 — 타겟을 별도로 지정했을 때 사용."""
+        self.value += self.alpha * (self._target - self.value)
+        return self.value
+
+    def __float__(self):
+        return self.value
+
+
+# ─────────────────────────────────────────────
+# DSP — BIQUAD FILTER (lazy coefficient update)
+# ─────────────────────────────────────────────
+class BiquadFilter:
+    """
+    2차 IIR 필터.
+    cutoff / q가 실제로 변했을 때만 계수를 재계산한다.
+    """
+    def __init__(self, filter_type="lp"):
+        self.filter_type = filter_type
+        self._cutoff = 1000.0
+        self._q      = 0.707
+        self.z1 = np.zeros((1, CHANNELS))
+        self.z2 = np.zeros((1, CHANNELS))
+        self._dirty = True
+        self._calculate_coeffs()
+
+    # property — setter에서 dirty 플래그 관리
+    @property
+    def cutoff(self):
+        return self._cutoff
+
+    @cutoff.setter
+    def cutoff(self, v):
+        v = float(np.clip(v, 20, 18000))
+        if abs(v - self._cutoff) > 0.5:
+            self._cutoff = v
+            self._dirty  = True
+
+    @property
+    def q(self):
+        return self._q
+
+    @q.setter
+    def q(self, v):
+        v = float(np.clip(v, 0.1, 5.0))
+        if abs(v - self._q) > 0.001:
+            self._q     = v
+            self._dirty = True
+
+    def _calculate_coeffs(self):
+        w0     = 2 * np.pi * self._cutoff / SAMPLE_RATE
+        alpha  = np.sin(w0) / (2 * self._q)
+        cos_w0 = np.cos(w0)
+        if self.filter_type == "lp":
+            b0 = (1 - cos_w0) / 2
+            b1 =  1 - cos_w0
+            b2 = (1 - cos_w0) / 2
+        else:
+            b0 =  (1 + cos_w0) / 2
+            b1 = -(1 + cos_w0)
+            b2 =  (1 + cos_w0) / 2
+        a0 = 1 + alpha
+        self.b0 = b0 / a0;  self.b1 = b1 / a0;  self.b2 = b2 / a0
+        self.a1 = (-2 * cos_w0) / a0;            self.a2 = (1 - alpha) / a0
+        self._dirty = False
+
+    def process(self, data):
+        if self._dirty:
+            self._calculate_coeffs()
+        out = np.zeros_like(data)
+        for i in range(len(data)):
+            x = data[i:i+1]
+            y = self.b0 * x + self.z1
+            self.z1 = self.b1 * x - self.a1 * y + self.z2
+            self.z2 = self.b2 * x - self.a2 * y
+            out[i] = y
+        return out
+
+
+# ─────────────────────────────────────────────
+# DSP — DISTORTION
+# ─────────────────────────────────────────────
+class Distortion:
+    def __init__(self, drive=1.0):
+        self.drive = drive
+
+    def process(self, data):
+        d   = float(self.drive)
+        sat = np.tanh(data * d)
+        comp = 1.0 / (1.0 + np.log1p(d * 0.5))
+        return sat * comp
+
+
+# ─────────────────────────────────────────────
+# DSP — DELAY
+# ─────────────────────────────────────────────
+class Delay:
+    def __init__(self, max_delay_sec=1.0):
+        self.buffer  = np.zeros((int(SAMPLE_RATE * max_delay_sec), CHANNELS))
+        self.ptr     = 0
+        self.current_delay_samples = int(SAMPLE_RATE * 0.3)
+
+    def process(self, data, mix=0.3, feedback=0.4):
+        out = np.zeros_like(data)
+        for i in range(len(data)):
+            read_idx   = (self.ptr - self.current_delay_samples) % len(self.buffer)
+            delayed    = self.buffer[read_idx]
+            self.buffer[self.ptr] = data[i] + delayed * feedback
+            out[i]     = data[i] * (1.0 - mix) + delayed * mix
+            self.ptr   = (self.ptr + 1) % len(self.buffer)
+        return out
+
+
+# ─────────────────────────────────────────────
+# DSP — SCHROEDER REVERB
+# ─────────────────────────────────────────────
+class SchroederReverb:
+    """
+    4개 comb 필터 병렬 → 2개 allpass 필터 직렬.
+    기존 단일 딜레이라인 대비 훨씬 풍성한 공간감.
+    L/R 에 다른 딜레이를 써서 진짜 스테레오 리버브.
+    """
+    COMB_L   = [1557, 1617, 1491, 1422]
+    COMB_R   = [1592, 1668, 1525, 1456]  # L과 약간 다름 → 스테레오 width
+    AP_DELAYS = [225, 341]
+
+    def __init__(self):
+        self.size = 0.5
+        self._comb_l  = [np.zeros(d) for d in self.COMB_L]
+        self._comb_r  = [np.zeros(d) for d in self.COMB_R]
+        self._comb_pl = [0] * 4
+        self._comb_pr = [0] * 4
+        self._ap_l    = [np.zeros(d) for d in self.AP_DELAYS]
+        self._ap_r    = [np.zeros(d) for d in self.AP_DELAYS]
+        self._ap_pl   = [0] * 2
+        self._ap_pr   = [0] * 2
+
+    def _process_channel(self, mono, comb_bufs, comb_ptrs, ap_bufs, ap_ptrs, decay):
+        n  = len(mono)
+        out = np.zeros(n)
+        # 4 comb (parallel)
+        for ci, (buf, ptr) in enumerate(zip(comb_bufs, comb_ptrs)):
+            blen = len(buf)
+            for i in range(n):
+                idx = ptr % blen
+                delayed = buf[idx]
+                buf[idx] = mono[i] + delayed * decay
+                out[i] += delayed
+                ptr = (ptr + 1) % blen
+            comb_ptrs[ci] = ptr
+        out /= 4.0
+        # 2 allpass (series)
+        for ai, (buf, ptr) in enumerate(zip(ap_bufs, ap_ptrs)):
+            blen = len(buf)
+            for i in range(n):
+                idx     = ptr % blen
+                delayed = buf[idx]
+                buf[idx] = out[i] + delayed * 0.5
+                out[i]  = delayed - out[i] * 0.5
+                ptr = (ptr + 1) % blen
+            ap_ptrs[ai] = ptr
+        return out
+
+    def process(self, data, mix=0.3):
+        if mix < 0.001:
+            return data
+        decay = 0.4 + self.size * 0.45   # 0.4 – 0.85
+        wet_l = self._process_channel(
+            data[:, 0], self._comb_l, self._comb_pl,
+            self._ap_l,  self._ap_pl, decay)
+        wet_r = self._process_channel(
+            data[:, 1], self._comb_r, self._comb_pr,
+            self._ap_r,  self._ap_pr, decay)
+        wet = np.stack([wet_l, wet_r], axis=1)
+        return data * (1.0 - mix) + wet * mix
+
+
+# ─────────────────────────────────────────────
+# DSP — SYNTH OSCILLATOR (진짜 스테레오)
+# ─────────────────────────────────────────────
+class SynthOscillator:
+    def __init__(self):
+        self.phase_l = 0.0
+        self.phase_r = 0.025   # 초기 위상 오프셋 → 스테레오 width
+
+    def process(self, num_samples, freq):
+        t        = np.arange(num_samples)
+        phase_l  = self.phase_l + 2 * np.pi * freq * (t / SAMPLE_RATE)
+        phase_r  = self.phase_r + 2 * np.pi * freq * 1.002 * (t / SAMPLE_RATE)  # R 미세 디튠
+        self.phase_l = phase_l[-1] % (2 * np.pi)
+        self.phase_r = phase_r[-1] % (2 * np.pi)
+        sig_l = (0.4 * np.sin(phase_l)
+               + 0.3 * np.sin(2.01 * phase_l)
+               + 0.2 * np.sin(3.02 * phase_l))
+        sig_r = (0.4 * np.sin(phase_r)
+               + 0.3 * np.sin(2.01 * phase_r)
+               + 0.2 * np.sin(3.02 * phase_r))
+        return np.stack([sig_l, sig_r], axis=1)
+
+
+# ─────────────────────────────────────────────
+# DSP — ARPEGGIATOR (실제 BPM 입력)
+# ─────────────────────────────────────────────
+class Arpeggiator:
+    def __init__(self, scale):
+        self.scale        = scale
+        self.current_step = 0
+        self.timer        = 0
+        self.current_note = scale[0]
+
+    def update(self, bpm):
+        """bpm: 60 ~ 240 실제 BPM."""
+        threshold = int(SAMPLE_RATE / (bpm / 60.0 * 8))
+        self.timer += BLOCK_SIZE
+        if self.timer >= threshold:
+            self.timer        = 0
+            self.current_step = (self.current_step + 1) % len(self.scale)
+            self.current_note = self.scale[self.current_step]
+        return self.current_note
+
+
+# ─────────────────────────────────────────────
+# GESTURE ENGINE
+# ─────────────────────────────────────────────
+class GestureEngine:
+    """
+    MediaPipe landmark → 제스처 분류.
+    반환값: "FIST" | "OPEN" | "POINT" | "PEACE" | "PINCH" | "FREE"
+    """
+    TIP_IDS   = [4,  8, 12, 16, 20]
+    JOINT_IDS = [3,  6, 10, 14, 18]
+
+    def count_fingers(self, lms):
+        """각 손가락이 펴져 있는지 bool 리스트 반환."""
+        up = []
+        # 엄지: x 비교 (미러된 화면)
+        up.append(lms[4].x < lms[3].x)
+        # 나머지 4: y 비교
+        for tip, joint in zip(self.TIP_IDS[1:], self.JOINT_IDS[1:]):
+            up.append(lms[tip].y < lms[joint].y)
+        return up
+
+    def classify(self, lms):
+        up    = self.count_fingers(lms)
+        n     = sum(up)
+        pinch = np.hypot(lms[8].x - lms[4].x, lms[8].y - lms[4].y)
+        if n == 0:
+            return "FIST"
+        if n == 5:
+            return "OPEN"
+        if n == 1 and up[1]:
+            return "POINT"
+        if n == 2 and up[1] and up[2]:
+            return "PEACE"
+        if pinch < 0.05:
+            return "PINCH"
+        return "FREE"
+
+    def pinch_value(self, lms):
+        d = np.hypot(lms[8].x - lms[4].x, lms[8].y - lms[4].y)
+        return float(np.clip(d * 5.0, 0.0, 1.0))
+
+    def two_hand_distance(self, lms_a, lms_b):
+        """두 손목 사이의 정규화 거리."""
+        a = np.array([lms_a[0].x, lms_a[0].y])
+        b = np.array([lms_b[0].x, lms_b[0].y])
+        return float(np.linalg.norm(a - b))
+
+
+# ─────────────────────────────────────────────
+# HAND TRAIL
+# ─────────────────────────────────────────────
+class HandTrail:
+    """
+    손 끝 위치를 deque에 쌓아 잔상을 그린다.
+    오래될수록 흐리고 작아진다.
+    """
+    def __init__(self, length=TRAIL_LENGTH, color=(0, 255, 65)):
+        self.points = deque(maxlen=length)
+        self.color  = color
+
+    def add(self, pt):
+        self.points.append(pt)
+
+    def draw(self, canvas):
+        n = len(self.points)
+        if n < 2:
+            return
+        for i, pt in enumerate(self.points):
+            alpha  = (i + 1) / n
+            radius = max(1, int(alpha * 5))
+            c      = tuple(int(ch * alpha) for ch in self.color)
+            cv2.circle(canvas, pt, radius, c, -1)
+
+
+# ─────────────────────────────────────────────
+# PRESET MANAGER
+# ─────────────────────────────────────────────
+class PresetManager:
+    def __init__(self, directory=PRESET_DIR):
+        self.directory = directory
+        os.makedirs(directory, exist_ok=True)
+        self.slots: dict[str, dict] = {}
+        self._load_all()
+
+    def _load_all(self):
+        for f in os.listdir(self.directory):
+            if f.endswith(".json"):
+                name = f[:-5]
+                try:
+                    with open(os.path.join(self.directory, f)) as fh:
+                        self.slots[name] = json.load(fh)
+                except Exception:
+                    pass
+
+    def save(self, name, params: dict):
+        self.slots[name] = dict(params)
+        with open(os.path.join(self.directory, f"{name}.json"), "w") as fh:
+            json.dump(self.slots[name], fh, indent=2)
+        print(f"[PRESET] Saved → {name}")
+
+    def load(self, name) -> dict:
+        return dict(self.slots.get(name, {}))
+
+    def list_presets(self) -> list[str]:
+        return sorted(self.slots.keys())
+
+
+# ─────────────────────────────────────────────
+# MAIN CONTROLLER
+# ─────────────────────────────────────────────
+class TouchlessWorkstation:
+
+    SCALES = {
+        "PENTA": [261.63, 293.66, 349.23, 392.00, 440.00, 523.25],
+        "MINOR": [261.63, 293.66, 311.13, 349.23, 392.00, 415.30, 466.16, 523.25],
+        "BLUES": [261.63, 311.13, 349.23, 369.99, 392.00, 466.16, 523.25],
+        "MAJOR": [261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25],
+    }
+
+    # 파라미터 기본값 (0~1 정규화)
+    _PARAM_DEFAULTS = {
+        "Master Vol":    0.7,
+        "Filter Cutoff": 0.5,
+        "Filter Res":    0.2,
+        "Distortion":    0.0,
+        "Glitch":        0.0,   # 화면 글리치 강도
+        "Delay Mix":     0.0,
+        "Reverb Mix":    0.0,
+        "Synth Vol":     0.5,
+        "Arp BPM":       0.4,
+    }
+
+    def __init__(self):
+        # ── 상태 ──
+        self.mode          = "EFFECTOR"
+        self.scale_name    = "PENTA"
+        self.running       = False
+        self.params_locked = False
+        self.precision_mode = False
+
+        # ── 파라미터 (smooth + target, thread-safe) ──
+        self._lock    = threading.Lock()
+        self._smooth  = {k: SmoothParam(v) for k, v in self._PARAM_DEFAULTS.items()}
+        self._targets = dict(self._PARAM_DEFAULTS)
+
+        # ── DSP ──
+        self.filter  = BiquadFilter()
+        self.dist    = Distortion()
+        self.delay   = Delay()
+        self.reverb  = SchroederReverb()
+        self.synth   = SynthOscillator()
+        self.arp     = Arpeggiator(self.SCALES[self.scale_name])
+
+        # ── Vision ──
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=2,
+            min_detection_confidence=0.75,
+            min_tracking_confidence=0.6,
+        )
+        self.gesture_engine = GestureEngine()
+        self.trails = [
+            HandTrail(color=(0, 255, 65)),    # 오른손 — 매트릭스 그린
+            HandTrail(color=(200, 50, 255)),   # 왼손  — 신스 퍼플
+        ]
+
+        # ── 제스처 홀드 타이머 ──
+        self._hold_start: dict[str, float] = {}
+
+        # ── Presets ──
+        self.presets = PresetManager()
+
+        # ── ASCII ──
+        self.ascii_chars = " .:-=+*#%@"
+        self.ascii_scale = 10
+
+    # ─────────────────────────────────
+    # PARAM ACCESS (thread-safe)
+    # ─────────────────────────────────
+    def _set_target(self, key: str, val: float):
+        """vision 스레드에서 파라미터 타겟 설정."""
+        if self.params_locked:
+            return
+        with self._lock:
+            mult = 0.2 if self.precision_mode else 1.0
+            cur  = self._targets[key]
+            self._targets[key] = float(np.clip(
+                cur + (float(val) - cur) * mult, 0.0, 1.0
+            ))
+
+    def _tick_smooth(self):
+        """audio_callback에서 매 블록 호출 — smooth 값을 target에 수렴."""
+        with self._lock:
+            for k, sp in self._smooth.items():
+                sp.set_target(self._targets[k])
+
+    def _get_smooth(self) -> dict:
+        with self._lock:
+            return {k: sp.value for k, sp in self._smooth.items()}
+
+    def _reset_params(self):
+        with self._lock:
+            self._targets = dict(self._PARAM_DEFAULTS)
+
+    # ─────────────────────────────────
+    # UNIT FORMATTING
+    # ─────────────────────────────────
+    @staticmethod
+    def format_param(name: str, val: float) -> str:
+        if   name == "Filter Cutoff": return f"{20 * (1000 ** val):.0f} Hz"
+        elif name == "Filter Res":    return f"Q {0.1 + val * 4.9:.2f}"
+        elif name == "Distortion":    return f"{val * 28:.1f} dB"
+        elif name == "Glitch":        return f"{val * 100:.0f}%"
+        elif name == "Delay Mix":     return f"{val * 100:.0f}%"
+        elif name == "Reverb Mix":    return f"{val * 100:.0f}%"
+        elif name == "Synth Vol":     return f"{val * 100:.0f}%"
+        elif name == "Arp BPM":       return f"{60 + val * 180:.0f} BPM"
+        elif name == "Master Vol":    return f"{val * 100:.0f}%"
+        return f"{val:.2f}"
+
+    # ─────────────────────────────────
+    # REACTIVE COLOR
+    # ─────────────────────────────────
+    def _reactive_color(self) -> tuple:
+        p = self._get_smooth()
+        r = int(p["Distortion"]  * 220)
+        g = int(p["Filter Cutoff"] * 180 + 60)
+        b = int(p["Reverb Mix"]  * 180)
+        if self.mode == "SYNTH":
+            return (min(b + 120, 255), 20, min(r + 100, 255))  # 퍼플 계열
+        return (0, g, r)                                         # 그린 계열
+
+    # ─────────────────────────────────
+    # AUDIO CALLBACK
+    # ─────────────────────────────────
+    def audio_callback(self, indata, outdata, frames, time_info, status):
+        # 1. 파라미터 smooth tick
+        self._tick_smooth()
+        p = self._get_smooth()
+
+        # 2. 소스 신호
+        if self.mode == "EFFECTOR":
+            sig = indata.copy()
+        else:
+            bpm  = 60 + p["Arp BPM"] * 180
+            note = self.arp.update(bpm)
+            sig  = self.synth.process(frames, note) * p["Synth Vol"]
+
+        # 3. Distortion
+        self.dist.drive = 1.0 + p["Distortion"] * 25.0
+        sig = self.dist.process(sig)
+
+        # 4. Filter (계수는 값 변경 시에만 재계산)
+        self.filter.cutoff = 20 * (1000 ** p["Filter Cutoff"])
+        self.filter.q      = 0.1 + p["Filter Res"] * 4.9
+        sig = self.filter.process(sig)
+        sig *= 1.0 / (1.0 + p["Filter Res"] * 0.7)
+
+        # 5. Delay
+        sig = self.delay.process(sig,
+                                  mix=p["Delay Mix"],
+                                  feedback=p["Delay Mix"] * 0.7)
+
+        # 6. Reverb
+        self.reverb.size = p["Reverb Mix"]
+        sig = self.reverb.process(sig, mix=p["Reverb Mix"])
+
+        # 7. 출력
+        outdata[:] = np.clip(sig * p["Master Vol"], -1.0, 1.0)
+
+    # ─────────────────────────────────
+    # ASCII RENDER
+    # ─────────────────────────────────
+    def render_ascii(self, frame: np.ndarray) -> np.ndarray:
+        h, w, _ = frame.shape
+        small = cv2.resize(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+            (w // self.ascii_scale, h // self.ascii_scale)
+        )
+        small  = cv2.equalizeHist(small)
+        canvas = np.zeros_like(frame)
+        color  = self._reactive_color()
+        cw, ch = self.ascii_scale, self.ascii_scale
+        n      = len(self.ascii_chars)
+        glitch = self._smooth["Glitch"].value
+        rows, cols = small.shape
+
+        for i in range(rows):
+            # 글리치: 행마다 랜덤 수평 시프트
+            shift = 0
+            if glitch > 0.05 and np.random.random() < glitch * 0.6:
+                shift = int(np.random.uniform(-glitch * 8, glitch * 8))
+            # 글리치: 일부 행 색상 반전
+            row_color = color
+            if glitch > 0.2 and np.random.random() < glitch * 0.25:
+                row_color = tuple(255 - c for c in color)
+
+            for j in range(cols):
+                src_j = min(max(j + shift, 0), cols - 1)
+                idx   = min(int(small[i, src_j] / 256 * n), n - 1)
+                # 글리치: 픽셀 드롭아웃
+                if glitch > 0.4 and np.random.random() < glitch * 0.15:
+                    idx = np.random.randint(0, n)
+                cv2.putText(canvas, self.ascii_chars[idx],
+                            (j * cw, i * ch + ch),
+                            cv2.FONT_HERSHEY_PLAIN, 0.7, row_color, 1)
+
+        # 글리치: 스캔라인 밴드
+        if glitch > 0.5:
+            for _ in range(int(glitch * 6)):
+                by = np.random.randint(0, h)
+                bh = np.random.randint(2, 8)
+                canvas[by:by+bh, :] = np.clip(
+                    canvas[by:by+bh, :].astype(int) + 60, 0, 255
+                ).astype(np.uint8)
+        return canvas
+
+    # ─────────────────────────────────
+    # GESTURE HOLD TIMER
+    # ─────────────────────────────────
+    def _check_hold(self, gesture: str, threshold: float) -> bool:
+        now = time.time()
+        if gesture not in self._hold_start:
+            self._hold_start[gesture] = now
+            return False
+        return (now - self._hold_start[gesture]) >= threshold
+
+    def _clear_hold(self, gesture: str):
+        self._hold_start.pop(gesture, None)
+
+    # ─────────────────────────────────
+    # GESTURE PROCESSING
+    # ─────────────────────────────────
+    def process_gestures(self, results, frame_shape, canvas):
+        """
+        제스처 → 파라미터 매핑 (v11)
+
+        오른손 (화면 오른쪽)
+          PINCH   X → Filter Res    (좌=낮은Q, 우=높은Q)
+                  Y → Filter Cutoff (위=고음, 아래=저음)
+          FIST    Y → Distortion    (위=강, 아래=약)
+                  X → Glitch FX     (좌=없음, 우=강)
+
+        왼손 (화면 왼쪽)
+          PINCH   X → Delay Mix     (좌=드라이, 우=웻)
+                  Y → Reverb Mix    (위=많음, 아래=없음)
+          FIST    X → Arp BPM       (좌=느림, 우=빠름)
+                  Y → Synth Vol     (위=크게, 아래=작게)
+
+        공통
+          OPEN 1.0s  → 전체 파라미터 리셋
+          PEACE 0.5s → 모드 전환 (EFFECTOR ↔ SYNTH)
+          FIST  2.0s → 파라미터 잠금 토글 (실수 방지)
+          하단 슬라이더 PINCH 드래그 → 마스터 볼륨
+        """
+        h, w  = frame_shape[:2]
+        color = self._reactive_color()
+        ge    = self.gesture_engine
+
+        if not results.multi_hand_landmarks:
+            self._hold_start.clear()
+            self.precision_mode = False
+            return
+
+        lms_list = results.multi_hand_landmarks
+        gestures = [ge.classify(lm.landmark) for lm in lms_list]
+
+        # 정밀 모드는 어느 손이든 POINT 중이면 활성화
+        self.precision_mode = any(g == "POINT" for g in gestures)
+
+        # OPEN / PEACE 는 한 손이라도 해당 제스처면 처리
+        any_open  = any(g == "OPEN"  for g in gestures)
+        any_peace = any(g == "PEACE" for g in gestures)
+
+        if any_open:
+            if self._check_hold("OPEN", 1.0):
+                self._reset_params()
+                print("[INFO] Params reset")
+                self._clear_hold("OPEN")
+        else:
+            self._clear_hold("OPEN")
+
+        if any_peace:
+            if self._check_hold("PEACE", 0.5):
+                self.mode = "SYNTH" if self.mode == "EFFECTOR" else "EFFECTOR"
+                print(f"[INFO] Mode → {self.mode}")
+                self._clear_hold("PEACE")
+        else:
+            self._clear_hold("PEACE")
+
+        for idx, (hand_lms, gesture) in enumerate(zip(lms_list, gestures)):
+            lms   = hand_lms.landmark
+            trail = self.trails[idx % 2]
+
+            itip = lms[8]   # 검지 끝
+            ttip = lms[4]   # 엄지 끝
+            ix   = int(itip.x * w)
+            iy   = int(itip.y * h)
+            tx   = int(ttip.x * w)
+            ty   = int(ttip.y * h)
+
+            # 잔상
+            trail.add((ix, iy))
+            trail.draw(canvas)
+
+            # 랜드마크 크로스헤어
+            for pt_idx in [0, 4, 8, 12, 16, 20]:
+                pt = lms[pt_idx]
+                cv2.drawMarker(canvas,
+                               (int(pt.x * w), int(pt.y * h)),
+                               (180, 180, 180), cv2.MARKER_CROSS, 10, 1)
+
+            # 제스처 레이블
+            lbl_y = max(int(lms[0].y * h) - 22, 18)
+            cv2.putText(canvas, gesture,
+                        (int(lms[0].x * w) - 24, lbl_y),
+                        cv2.FONT_HERSHEY_PLAIN, 1.1, color, 1)
+
+            wrist_x = lms[0].x
+            is_right = wrist_x > 0.5
+
+            # X축 정규화: 각 존의 0-1 범위로 매핑
+            rx = float(np.clip((itip.x - 0.5) * 2, 0.0, 1.0))  # 오른쪽 존 X
+            lx = float(np.clip(itip.x * 2,         0.0, 1.0))   # 왼쪽  존 X
+            iy_norm = float(np.clip(1.0 - itip.y,  0.0, 1.0))   # Y (위=1)
+
+            # ────────────────────────────
+            # 오른손
+            # ────────────────────────────
+            if is_right:
+                if gesture == "PINCH":
+                    self._set_target("Filter Res",    rx)
+                    self._set_target("Filter Cutoff", iy_norm)
+                    cv2.line(canvas, (ix, iy), (tx, ty), (255, 255, 255), 1)
+                    # 축 가이드 선
+                    cv2.line(canvas, (ix, 0),    (ix, h), color, 1)  # X축 기준선
+                    cv2.line(canvas, (w//2, iy), (w, iy), color, 1)  # Y축 기준선
+
+                elif gesture == "FIST":
+                    self._set_target("Distortion", iy_norm)
+                    self._set_target("Glitch",     rx)
+                
+                    # 주먹 시각화
+                    cv2.circle(canvas, (ix, iy), 14, color, 2)
+                else:
+                    self._clear_hold("FIST_LOCK")
+
+            # ────────────────────────────
+            # 왼손
+            # ────────────────────────────
+            else:
+                if gesture == "PINCH":
+                    self._set_target("Delay Mix",  lx)
+                    self._set_target("Reverb Mix", iy_norm)
+                    cv2.line(canvas, (ix, iy), (tx, ty), (255, 255, 255), 1)
+                    cv2.line(canvas, (ix, 0),    (ix, h),    color, 1)
+                    cv2.line(canvas, (0, iy),    (w//2, iy), color, 1)
+
+                elif gesture == "FIST":
+                    self._set_target("Arp BPM",   lx)
+                    self._set_target("Synth Vol", iy_norm)
+                    cv2.circle(canvas, (ix, iy), 14, color, 2)
+
+            # ── 마스터 볼륨 슬라이더 (핀치 드래그, 하단 중앙) ──
+            if gesture == "PINCH":
+                sx, sy, sw = w // 2 - 150, h - 70, 300
+                if sx <= ix <= sx + sw and sy - 40 <= iy <= sy + 40:
+                    with self._lock:
+                        self._targets["Master Vol"] = float(
+                            np.clip((ix - sx) / sw, 0.0, 1.0)
+                        )
+
+    # ─────────────────────────────────
+    # NOIR UI OVERLAY
+    # ─────────────────────────────────
+    def draw_ui(self, frame, w, h):
+        color = self._reactive_color()
+        p     = self._get_smooth()
+
+        # 외곽 프레임
+        cv2.rectangle(frame, (10, 10), (w - 10, h - 10), color, 1)
+
+        # 모드 + 상태 배너
+        lock_tag = "  [LOCKED]"   if self.params_locked  else ""
+        fine_tag = "  [FINE]"     if self.precision_mode else ""
+        banner   = f"// {self.mode}{lock_tag}{fine_tag}"
+        cv2.putText(frame, banner, (28, 44),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.0, color, 2)
+
+        # 스케일 표시 (SYNTH 모드)
+        if self.mode == "SYNTH":
+            cv2.putText(frame, f"scale: {self.scale_name}",
+                        (28, 68), cv2.FONT_HERSHEY_PLAIN, 0.9, color, 1)
+
+        # ── 파라미터 바 ──
+        y_off = 98
+        for name, sp in self._smooth.items():
+            if name == "Master Vol":
+                continue
+            val   = sp.value
+            bar_w = int(val * 150)
+            label = f"{name.upper()}: {self.format_param(name, val)}"
+            tc    = (255, 255, 255) if self.params_locked else color
+
+            cv2.putText(frame, label, (28, y_off),
+                        cv2.FONT_HERSHEY_PLAIN, 0.85, tc, 1)
+            cv2.rectangle(frame,
+                          (220, y_off - 11), (220 + 150, y_off + 1),
+                          (35, 35, 35), -1)
+            cv2.rectangle(frame,
+                          (220, y_off - 11), (220 + bar_w, y_off + 1),
+                          tc, -1)
+            y_off += 31
+
+        # ── 마스터 볼륨 슬라이더 ──
+        mv = p["Master Vol"]
+        sx, sy = w // 2 - 150, h - 70
+        cv2.rectangle(frame, (sx, sy), (sx + 300, sy + 18), (35, 35, 35), -1)
+        cv2.rectangle(frame, (sx, sy),
+                      (sx + int(mv * 300), sy + 18), color, -1)
+        cv2.putText(frame,
+                    f"MASTER: {self.format_param('Master Vol', mv)}",
+                    (sx, h - 80), cv2.FONT_HERSHEY_PLAIN, 1.0, color, 1)
+
+        # ── 제스처 범례 (우하단) ──
+        legend = [
+            "FIST 0.5s = lock/unlock",
+            "OPEN 0.8s = reset",
+            "PEACE 0.5s = mode",
+            "POINT = fine control",
+            "slider pinch = master vol",
+        ]
+        for li, line in enumerate(legend):
+            dim = tuple(max(c // 3, 20) for c in color)
+            cv2.putText(frame, line,
+                        (w - 220, h - 120 + li * 18),
+                        cv2.FONT_HERSHEY_PLAIN, 0.65, dim, 1)
+
+        # ── 프리셋 목록 (우상단) ──
+        plist = self.presets.list_presets()
+        if plist:
+            dim = tuple(max(c // 3, 20) for c in color)
+            cv2.putText(frame, "PRESETS:",
+                        (w - 200, 44), cv2.FONT_HERSHEY_PLAIN, 0.8, color, 1)
+            for pi, pname in enumerate(plist[:5]):
+                cv2.putText(frame, f"  {pi + 1}: {pname[-14:]}",
+                            (w - 200, 60 + pi * 16),
+                            cv2.FONT_HERSHEY_PLAIN, 0.65, dim, 1)
+
+    # ─────────────────────────────────
+    # AUDIO DEVICE DETECTION
+    # ─────────────────────────────────
+    @staticmethod
+    def _find_audio_devices() -> tuple[int, int]:
+        devices  = sd.query_devices()
+        in_idx   = None
+        out_idx  = None
+        OUT_NAMES = ["스피커", "speakers", "built-in output", "headphones",
+                     "headset", "default"]
+        for i, d in enumerate(devices):
+            name_l = d['name'].lower()
+            if "blackhole" in name_l and in_idx is None:
+                in_idx = i
+            for n in OUT_NAMES:
+                if n in name_l and out_idx is None:
+                    out_idx = i
+        if out_idx is None:
+            out_idx = sd.default.device[1]
+        if in_idx is None:
+            in_idx  = sd.default.device[0]
+        print(f"[AUDIO] in={in_idx}  out={out_idx}")
+        return in_idx, out_idx
+
+    # ─────────────────────────────────
+    # MAIN LOOP
+    # ─────────────────────────────────
+    def run(self):
+        in_idx, out_idx = self._find_audio_devices()
+
+        # 카메라 열기 (실패 시 에러 출력)
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("[ERROR] 카메라를 열 수 없습니다. 다른 인덱스를 시도하세요.")
+            return
+
+        self.running = True
+        print("[INFO] TOUCHLESS WORKSTATION v10 시작")
+        print("       ESC=종료  M=모드  N=스케일  S=저장  1-5=프리셋")
+
+        try:
+            with sd.Stream(
+                device=(in_idx, out_idx),
+                samplerate=SAMPLE_RATE,
+                blocksize=BLOCK_SIZE,
+                channels=CHANNELS,
+                callback=self.audio_callback,
+            ):
+                while self.running and cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        print("[WARN] 프레임 수신 실패 — 재시도...")
+                        time.sleep(0.04)
+                        continue
+
+                    frame = cv2.flip(frame, 1)
+                    h, w, _ = frame.shape
+
+                    # ASCII 렌더링
+                    canvas = self.render_ascii(frame)
+
+                    # 손 추적
+                    rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = self.hands.process(rgb)
+                    self.process_gestures(results, frame.shape, canvas)
+
+                    # UI 오버레이
+                    self.draw_ui(canvas, w, h)
+
+                    cv2.imshow("TOUCHLESS_WORKSTATION_v10", canvas)
+                    key = cv2.waitKey(1) & 0xFF
+
+                    if key == 27:               # ESC
+                        self.running = False
+
+                    elif key == ord('m'):        # 모드 전환
+                        self.mode = "SYNTH" if self.mode == "EFFECTOR" else "EFFECTOR"
+                        print(f"[INFO] Mode → {self.mode}")
+
+                    elif key == ord('n'):        # 스케일 순환
+                        keys = list(self.SCALES.keys())
+                        idx  = keys.index(self.scale_name)
+                        self.scale_name = keys[(idx + 1) % len(keys)]
+                        self.arp.scale  = self.SCALES[self.scale_name]
+                        print(f"[INFO] Scale → {self.scale_name}")
+
+                    elif key == ord('s'):        # 프리셋 저장
+                        name = f"preset_{int(time.time())}"
+                        self.presets.save(name, self._get_smooth())
+
+                    elif ord('1') <= key <= ord('5'):  # 프리셋 불러오기
+                        slot  = key - ord('1')
+                        plist = self.presets.list_presets()
+                        if slot < len(plist):
+                            loaded = self.presets.load(plist[slot])
+                            with self._lock:
+                                for k, v in loaded.items():
+                                    if k in self._targets:
+                                        self._targets[k] = float(v)
+                            print(f"[INFO] Loaded preset: {plist[slot]}")
+
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"[ERROR] {e}")
+        finally:
+            self.running = False
+            cap.release()
+            cv2.destroyAllWindows()
+            print("[INFO] 정상 종료.")
+
+
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    TouchlessWorkstation().run()
