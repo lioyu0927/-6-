@@ -10,3 +10,5 @@
 유준혁 : 40%
 박정욱 : 35%
 정소율 : 25%
+
+시연 영상 : https://drive.google.com/file/d/12LV1sF6QY4G7K8fcll8YIh-aIczDpgqL/view?usp=sharing
